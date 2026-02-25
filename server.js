@@ -1,3 +1,6 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 import http from "http";
 import { URL } from "url";
 
@@ -10,15 +13,15 @@ const jobs = {};
 // Helper: fetch stock from Finnhub
 async function fetchQuote(symbol) {
   const apiKey = process.env.FINNHUB_API_KEY;
-  const res = await fetch(
-    `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${apiKey}`
-  );
+  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`;
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Finnhub error: ${res.status}`);
 
   const data = await res.json();
 
-  if (!data || data.t === 0) {
-    throw new Error("Invalid symbol or no data returned");
-  }
+  // If symbol is invalid or no data, Finnhub often gives t: 0
+  if (!data || data.t === 0) throw new Error(`No data for symbol: ${symbol}`);
 
   return {
     symbol,
