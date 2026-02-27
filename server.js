@@ -1,10 +1,12 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-import http from "http";
-import { URL } from "url";
+import express from "express";
 
 const PORT = 3000;
+
+const app = express();
+app.use(express.json());
 
 // In-memory storage
 const history = {};
@@ -13,12 +15,16 @@ const jobs = {};
 // Helper: fetch stock from Finnhub
 async function fetchQuote(symbol) {
   const apiKey = process.env.FINNHUB_API_KEY;
-  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${apiKey}`;
+  if (!apiKey) throw new Error("Missing FINNHUB_API_KEY in environment");
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Finnhub error: ${res.status}`);
+  const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+    symbol
+  )}&token=${apiKey}`;
 
-  const data = await res.json();
+  const finnhubRes = await fetch(url);
+  if (!finnhubRes.ok) throw new Error(`Finnhub error: ${finnhubRes.status}`);
+
+  const data = await finnhubRes.json();
 
   // If symbol is invalid or no data, Finnhub often gives t: 0
   if (!data || data.t === 0) throw new Error(`No data for symbol: ${symbol}`);
@@ -30,118 +36,93 @@ async function fetchQuote(symbol) {
     l: data.l,
     c: data.c,
     pc: data.pc,
-    fetchedAt: new Date().toISOString()
+    fetchedAt: new Date().toISOString(),
   };
 }
 
-// Utility to read JSON body
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", chunk => (body += chunk));
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(body || "{}"));
-      } catch (err) {
-        reject(new Error("Invalid JSON"));
-      }
-    });
-  });
-}
+// POST /start-monitoring
+app.post("/start-monitoring", (req, res) => {
+  const { symbol, minutes = 0, seconds = 0 } = req.body ?? {};
 
-const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
-  const pathname = parsedUrl.pathname;
+  if (
+    typeof symbol !== "string" ||
+    !symbol.trim() ||
+    !Number.isInteger(minutes) ||
+    !Number.isInteger(seconds) ||
+    minutes < 0 ||
+    seconds < 0
+  ) {
+    return res.status(400).json({ error: "Invalid input" });
+  }
 
-  res.setHeader("Content-Type", "application/json");
+  const intervalMs = (minutes * 60 + seconds) * 1000;
+  if (intervalMs <= 0) {
+    return res.status(400).json({ error: "Interval must be > 0" });
+  }
 
-  try {
-    // POST /start-monitoring
-    if (req.method === "POST" && pathname === "/start-monitoring") {
-      const body = await readBody(req);
+  const sym = symbol.toUpperCase();
 
-      const { symbol, minutes = 0, seconds = 0 } = body;
+  // Clear existing job if exists
+  if (jobs[sym]) clearInterval(jobs[sym]);
 
-      if (
-        typeof symbol !== "string" ||
-        !symbol.trim() ||
-        !Number.isInteger(minutes) ||
-        !Number.isInteger(seconds) ||
-        minutes < 0 ||
-        seconds < 0
-      ) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ error: "Invalid input" }));
-      }
+  history[sym] = history[sym] || [];
 
-      const intervalMs = (minutes * 60 + seconds) * 1000;
-      if (intervalMs <= 0) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ error: "Interval must be > 0" }));
-      }
-
-      const sym = symbol.toUpperCase();
-
-      // Clear existing job if exists
-      if (jobs[sym]) {
-        clearInterval(jobs[sym]);
-      }
-
-      history[sym] = history[sym] || [];
-
-      jobs[sym] = setInterval(async () => {
-        try {
-          const record = await fetchQuote(sym);
-          history[sym].push(record);
-        } catch (err) {
-          console.error("Fetch error:", err.message);
-        }
-      }, intervalMs);
-
-      return res.end(JSON.stringify({ message: "Monitoring started", symbol: sym }));
-    }
-
-    // GET /history?symbol=AAPL
-    if (req.method === "GET" && pathname === "/history") {
-      const symbol = parsedUrl.searchParams.get("symbol");
-
-      if (!symbol) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ error: "Symbol required" }));
-      }
-
-      const sym = symbol.toUpperCase();
-      return res.end(JSON.stringify(history[sym] || []));
-    }
-
-    // POST /refresh
-    if (req.method === "POST" && pathname === "/refresh") {
-      const body = await readBody(req);
-      const { symbol } = body;
-
-      if (!symbol || typeof symbol !== "string") {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ error: "Invalid symbol" }));
-      }
-
-      const sym = symbol.toUpperCase();
+  jobs[sym] = setInterval(async () => {
+    try {
       const record = await fetchQuote(sym);
-
-      history[sym] = history[sym] || [];
       history[sym].push(record);
+    } catch (err) {
+      console.error("Fetch error:", err.message);
+    }
+  }, intervalMs);
 
-      return res.end(JSON.stringify(record));
+  return res.json({ message: "Monitoring started", symbol: sym });
+});
+
+// GET /history?symbol=AAPL
+app.get("/history", (req, res) => {
+  const symbol = req.query.symbol;
+
+  if (typeof symbol !== "string" || !symbol.trim()) {
+    return res.status(400).json({ error: "Symbol required" });
+  }
+
+  const sym = symbol.toUpperCase();
+  return res.json(history[sym] || []);
+});
+
+// POST /refresh
+app.post("/refresh", async (req, res, next) => {
+  try {
+    const { symbol } = req.body ?? {};
+
+    if (typeof symbol !== "string" || !symbol.trim()) {
+      return res.status(400).json({ error: "Invalid symbol" });
     }
 
-    // Not found
-    res.statusCode = 404;
-    res.end(JSON.stringify({ error: "Not found" }));
+    const sym = symbol.toUpperCase();
+    const record = await fetchQuote(sym);
+
+    history[sym] = history[sym] || [];
+    history[sym].push(record);
+
+    return res.json(record);
   } catch (err) {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ error: err.message }));
+    next(err);
   }
 });
 
-server.listen(PORT, () => {
+// Not found handler
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+// Error handler (must be last)
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message || "Server error" });
+});
+
+app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
